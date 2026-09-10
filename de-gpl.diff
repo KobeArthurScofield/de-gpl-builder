@@ -1,0 +1,2539 @@
+diff --git a/README.md b/README.md
+index d52ca9bb3471..456bd65a9d9b 100644
+--- a/README.md
++++ b/README.md
+@@ -174,7 +174,6 @@
+ - Cores
+   - [Amnezia VPN](https://github.com/amnezia-vpn)
+   - [mihomo](https://github.com/MetaCubeX/mihomo)
+-  - [sing-box](https://github.com/SagerNet/sing-box)
+ 
+ ## Contributing
+ 
+diff --git a/common/session/context.go b/common/session/context.go
+index abe4219ca935..8758f9276220 100644
+--- a/common/session/context.go
++++ b/common/session/context.go
+@@ -7,7 +7,6 @@ import (
+ 	"github.com/xtls/xray-core/common/ctx"
+ 	"github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/features/outbound"
+-	"github.com/xtls/xray-core/features/routing"
+ )
+ 
+ //go:linkname IndependentCancelCtx context.newCancelCtx
+@@ -20,14 +19,13 @@ const (
+ 	isReverseMuxKey           ctx.SessionKey = 4  // is reverse mux
+ 	sockoptSessionKey         ctx.SessionKey = 5  // used by dokodemo to only receive sockopt.Mark
+ 	trackedConnectionErrorKey ctx.SessionKey = 6  // used by observer to get outbound error
+-	dispatcherKey             ctx.SessionKey = 7  // used by ss2022 inbounds to get dispatcher
+-	timeoutOnlyKey            ctx.SessionKey = 8  // mux context's child contexts to only cancel when its own traffic times out
+-	allowedNetworkKey         ctx.SessionKey = 9  // muxcool server control incoming request tcp/udp
+-	fullHandlerKey            ctx.SessionKey = 10 // outbound gets full handler
+-	mitmAlpn11Key             ctx.SessionKey = 11 // used by TLS dialer
+-	mitmServerNameKey         ctx.SessionKey = 12 // used by TLS dialer
+-
+-	streamSettingsKey ctx.SessionKey = 13
++	timeoutOnlyKey            ctx.SessionKey = 7  // mux context's child contexts to only cancel when its own traffic times out
++	allowedNetworkKey         ctx.SessionKey = 8  // muxcool server control incoming request tcp/udp
++	fullHandlerKey            ctx.SessionKey = 9  // outbound gets full handler
++	mitmAlpn11Key             ctx.SessionKey = 10 // used by TLS dialer
++	mitmServerNameKey         ctx.SessionKey = 11 // used by TLS dialer
++
++	streamSettingsKey ctx.SessionKey = 12
+ )
+ 
+ func ContextWithInbound(ctx context.Context, inbound *Inbound) context.Context {
+@@ -129,17 +127,6 @@ func TrackedConnectionError(ctx context.Context, tracker TrackedRequestErrorFeed
+ 	return context.WithValue(ctx, trackedConnectionErrorKey, tracker)
+ }
+ 
+-func ContextWithDispatcher(ctx context.Context, dispatcher routing.Dispatcher) context.Context {
+-	return context.WithValue(ctx, dispatcherKey, dispatcher)
+-}
+-
+-func DispatcherFromContext(ctx context.Context) routing.Dispatcher {
+-	if dispatcher, ok := ctx.Value(dispatcherKey).(routing.Dispatcher); ok {
+-		return dispatcher
+-	}
+-	return nil
+-}
+-
+ func ContextWithTimeoutOnly(ctx context.Context, only bool) context.Context {
+ 	return context.WithValue(ctx, timeoutOnlyKey, only)
+ }
+diff --git a/common/singbridge/destination.go b/common/singbridge/destination.go
+deleted file mode 100644
+index 217c4d082810..000000000000
+--- a/common/singbridge/destination.go
++++ /dev/null
+@@ -1,53 +0,0 @@
+-package singbridge
+-
+-import (
+-	M "github.com/sagernet/sing/common/metadata"
+-	N "github.com/sagernet/sing/common/network"
+-	"github.com/xtls/xray-core/common/errors"
+-	"github.com/xtls/xray-core/common/net"
+-)
+-
+-func ToNetwork(network string) net.Network {
+-	switch N.NetworkName(network) {
+-	case N.NetworkTCP:
+-		return net.Network_TCP
+-	case N.NetworkUDP:
+-		return net.Network_UDP
+-	default:
+-		return net.Network_Unknown
+-	}
+-}
+-
+-func ToDestination(socksaddr M.Socksaddr, network net.Network) (net.Destination, error) {
+-	// IsFqdn() implicitly checks if the domain name is valid
+-	if socksaddr.IsFqdn() {
+-		return net.Destination{
+-			Network: network,
+-			Address: net.DomainAddress(socksaddr.Fqdn),
+-			Port:    net.Port(socksaddr.Port),
+-		}, nil
+-	}
+-
+-	// IsIP() implicitly checks if the IP address is valid
+-	if socksaddr.IsIP() {
+-		return net.Destination{
+-			Network: network,
+-			Address: net.IPAddress(socksaddr.Addr.AsSlice()),
+-			Port:    net.Port(socksaddr.Port),
+-		}, nil
+-	}
+-
+-	return net.Destination{}, errors.New("invalid socks address: ", socksaddr)
+-}
+-
+-func ToSocksaddr(destination net.Destination) M.Socksaddr {
+-	var addr M.Socksaddr
+-	switch destination.Address.Family() {
+-	case net.AddressFamilyDomain:
+-		addr.Fqdn = destination.Address.Domain()
+-	default:
+-		addr.Addr = M.AddrFromIP(destination.Address.IP())
+-	}
+-	addr.Port = uint16(destination.Port)
+-	return addr
+-}
+diff --git a/common/singbridge/dialer.go b/common/singbridge/dialer.go
+deleted file mode 100644
+index 07c428813a47..000000000000
+--- a/common/singbridge/dialer.go
++++ /dev/null
+@@ -1,72 +0,0 @@
+-package singbridge
+-
+-import (
+-	"context"
+-	"os"
+-
+-	M "github.com/sagernet/sing/common/metadata"
+-	N "github.com/sagernet/sing/common/network"
+-	"github.com/xtls/xray-core/common/net"
+-	"github.com/xtls/xray-core/common/net/cnc"
+-	"github.com/xtls/xray-core/common/session"
+-	"github.com/xtls/xray-core/proxy"
+-	"github.com/xtls/xray-core/transport"
+-	"github.com/xtls/xray-core/transport/internet"
+-	"github.com/xtls/xray-core/transport/pipe"
+-)
+-
+-var _ N.Dialer = (*XrayDialer)(nil)
+-
+-type XrayDialer struct {
+-	internet.Dialer
+-}
+-
+-func NewDialer(dialer internet.Dialer) *XrayDialer {
+-	return &XrayDialer{dialer}
+-}
+-
+-func (d *XrayDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+-	dest, err := ToDestination(destination, ToNetwork(network))
+-	if err != nil {
+-		return nil, err
+-	}
+-	return d.Dialer.Dial(ctx, dest)
+-}
+-
+-func (d *XrayDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+-	return nil, os.ErrInvalid
+-}
+-
+-type XrayOutboundDialer struct {
+-	outbound proxy.Outbound
+-	dialer   internet.Dialer
+-}
+-
+-func NewOutboundDialer(outbound proxy.Outbound, dialer internet.Dialer) *XrayOutboundDialer {
+-	return &XrayOutboundDialer{outbound, dialer}
+-}
+-
+-func (d *XrayOutboundDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+-	dest, err := ToDestination(destination, ToNetwork(network))
+-	if err != nil {
+-		return nil, err
+-	}
+-	outbounds := session.OutboundsFromContext(ctx)
+-	if len(outbounds) == 0 {
+-		outbounds = []*session.Outbound{{}}
+-		ctx = session.ContextWithOutbounds(ctx, outbounds)
+-	}
+-	ob := outbounds[len(outbounds)-1]
+-	ob.Target = dest
+-
+-	opts := []pipe.Option{pipe.WithSizeLimit(64 * 1024)}
+-	uplinkReader, uplinkWriter := pipe.New(opts...)
+-	downlinkReader, downlinkWriter := pipe.New(opts...)
+-	conn := cnc.NewConnection(cnc.ConnectionInputMulti(downlinkWriter), cnc.ConnectionOutputMulti(uplinkReader))
+-	go d.outbound.Process(ctx, &transport.Link{Reader: downlinkReader, Writer: uplinkWriter}, d.dialer)
+-	return conn, nil
+-}
+-
+-func (d *XrayOutboundDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+-	return nil, os.ErrInvalid
+-}
+diff --git a/common/singbridge/error.go b/common/singbridge/error.go
+deleted file mode 100644
+index ac9e63517781..000000000000
+--- a/common/singbridge/error.go
++++ /dev/null
+@@ -1,10 +0,0 @@
+-package singbridge
+-
+-import E "github.com/sagernet/sing/common/exceptions"
+-
+-func ReturnError(err error) error {
+-	if E.IsClosedOrCanceled(err) {
+-		return nil
+-	}
+-	return err
+-}
+diff --git a/common/singbridge/handler.go b/common/singbridge/handler.go
+deleted file mode 100644
+index ee4b7c15f07e..000000000000
+--- a/common/singbridge/handler.go
++++ /dev/null
+@@ -1,58 +0,0 @@
+-package singbridge
+-
+-import (
+-	"context"
+-	"io"
+-
+-	M "github.com/sagernet/sing/common/metadata"
+-	N "github.com/sagernet/sing/common/network"
+-	"github.com/xtls/xray-core/common/buf"
+-	"github.com/xtls/xray-core/common/errors"
+-	"github.com/xtls/xray-core/common/net"
+-	"github.com/xtls/xray-core/features/routing"
+-	"github.com/xtls/xray-core/transport"
+-)
+-
+-var (
+-	_ N.TCPConnectionHandler = (*Dispatcher)(nil)
+-	_ N.UDPConnectionHandler = (*Dispatcher)(nil)
+-)
+-
+-type Dispatcher struct {
+-	upstream     routing.Dispatcher
+-	newErrorFunc func(values ...any) *errors.Error
+-}
+-
+-func NewDispatcher(dispatcher routing.Dispatcher, newErrorFunc func(values ...any) *errors.Error) *Dispatcher {
+-	return &Dispatcher{
+-		upstream:     dispatcher,
+-		newErrorFunc: newErrorFunc,
+-	}
+-}
+-
+-func (d *Dispatcher) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
+-	dest, err := ToDestination(metadata.Destination, net.Network_TCP)
+-	if err != nil {
+-		return err
+-	}
+-	xConn := NewConn(conn)
+-	return d.upstream.DispatchLink(ctx, dest, &transport.Link{
+-		Reader: xConn,
+-		Writer: xConn,
+-	})
+-}
+-
+-func (d *Dispatcher) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata M.Metadata) error {
+-	dest, err := ToDestination(metadata.Destination, net.Network_UDP)
+-	if err != nil {
+-		return err
+-	}
+-	return d.upstream.DispatchLink(ctx, dest, &transport.Link{
+-		Reader: buf.NewPacketReader(conn.(io.Reader)),
+-		Writer: buf.NewWriter(conn.(io.Writer)),
+-	})
+-}
+-
+-func (d *Dispatcher) NewError(ctx context.Context, err error) {
+-	errors.LogInfo(ctx, err.Error())
+-}
+diff --git a/common/singbridge/logger.go b/common/singbridge/logger.go
+deleted file mode 100644
+index 16ff29cc3c9c..000000000000
+--- a/common/singbridge/logger.go
++++ /dev/null
+@@ -1,70 +0,0 @@
+-package singbridge
+-
+-import (
+-	"context"
+-
+-	"github.com/sagernet/sing/common/logger"
+-	"github.com/xtls/xray-core/common/errors"
+-)
+-
+-var _ logger.ContextLogger = (*XrayLogger)(nil)
+-
+-type XrayLogger struct {
+-	newError func(values ...any) *errors.Error
+-}
+-
+-func NewLogger(newErrorFunc func(values ...any) *errors.Error) *XrayLogger {
+-	return &XrayLogger{
+-		newErrorFunc,
+-	}
+-}
+-
+-func (l *XrayLogger) Trace(args ...any) {
+-}
+-
+-func (l *XrayLogger) Debug(args ...any) {
+-	errors.LogDebug(context.Background(), args...)
+-}
+-
+-func (l *XrayLogger) Info(args ...any) {
+-	errors.LogInfo(context.Background(), args...)
+-}
+-
+-func (l *XrayLogger) Warn(args ...any) {
+-	errors.LogWarning(context.Background(), args...)
+-}
+-
+-func (l *XrayLogger) Error(args ...any) {
+-	errors.LogError(context.Background(), args...)
+-}
+-
+-func (l *XrayLogger) Fatal(args ...any) {
+-}
+-
+-func (l *XrayLogger) Panic(args ...any) {
+-}
+-
+-func (l *XrayLogger) TraceContext(ctx context.Context, args ...any) {
+-}
+-
+-func (l *XrayLogger) DebugContext(ctx context.Context, args ...any) {
+-	errors.LogDebug(ctx, args...)
+-}
+-
+-func (l *XrayLogger) InfoContext(ctx context.Context, args ...any) {
+-	errors.LogInfo(ctx, args...)
+-}
+-
+-func (l *XrayLogger) WarnContext(ctx context.Context, args ...any) {
+-	errors.LogWarning(ctx, args...)
+-}
+-
+-func (l *XrayLogger) ErrorContext(ctx context.Context, args ...any) {
+-	errors.LogError(ctx, args...)
+-}
+-
+-func (l *XrayLogger) FatalContext(ctx context.Context, args ...any) {
+-}
+-
+-func (l *XrayLogger) PanicContext(ctx context.Context, args ...any) {
+-}
+diff --git a/common/singbridge/packet.go b/common/singbridge/packet.go
+deleted file mode 100644
+index fde4bed3d69d..000000000000
+--- a/common/singbridge/packet.go
++++ /dev/null
+@@ -1,107 +0,0 @@
+-package singbridge
+-
+-import (
+-	"context"
+-	"time"
+-
+-	B "github.com/sagernet/sing/common/buf"
+-	"github.com/sagernet/sing/common/bufio"
+-	M "github.com/sagernet/sing/common/metadata"
+-	"github.com/xtls/xray-core/common"
+-	"github.com/xtls/xray-core/common/buf"
+-	"github.com/xtls/xray-core/common/net"
+-	"github.com/xtls/xray-core/common/signal"
+-	"github.com/xtls/xray-core/transport"
+-)
+-
+-func CopyPacketConn(ctx context.Context, inboundConn net.Conn, link *transport.Link, destination net.Destination, serverConn net.PacketConn) error {
+-	cancel := func() {
+-		common.Interrupt(link.Reader)
+-		common.Interrupt(serverConn)
+-	}
+-	conn := &PacketConnWrapper{
+-		Reader: link.Reader,
+-		Writer: link.Writer,
+-		Dest:   destination,
+-		Conn:   inboundConn,
+-		T:      signal.CancelAfterInactivity(ctx, cancel, 300*time.Second),
+-	}
+-	return ReturnError(bufio.CopyPacketConn(ctx, conn, bufio.NewPacketConn(serverConn)))
+-}
+-
+-type PacketConnWrapper struct {
+-	buf.Reader
+-	buf.Writer
+-	net.Conn
+-	Dest   net.Destination
+-	cached buf.MultiBuffer
+-
+-	// A simple patch to avoid goroutine leak since sing infra cannot awake read block by write err
+-	T *signal.ActivityTimer
+-}
+-
+-func (w *PacketConnWrapper) ReadPacket(buffer *B.Buffer) (addr M.Socksaddr, err error) {
+-	w.T.Update()
+-	defer func() {
+-		if err != nil {
+-			// uplinkonly
+-			w.T.SetTimeout(2 * time.Second)
+-		}
+-	}()
+-	if w.cached != nil {
+-		mb, bb := buf.SplitFirst(w.cached)
+-		if bb == nil {
+-			w.cached = nil
+-		} else {
+-			buffer.Write(bb.Bytes())
+-			w.cached = mb
+-			var destination net.Destination
+-			if bb.UDP != nil {
+-				destination = *bb.UDP
+-			} else {
+-				destination = w.Dest
+-			}
+-			bb.Release()
+-			return ToSocksaddr(destination), nil
+-		}
+-	}
+-	mb, err := w.ReadMultiBuffer()
+-	nb, bb := buf.SplitFirst(mb)
+-	if bb == nil {
+-		return M.Socksaddr{}, nil
+-	} else {
+-		buffer.Write(bb.Bytes())
+-		w.cached = nb
+-		var destination net.Destination
+-		if bb.UDP != nil {
+-			destination = *bb.UDP
+-		} else {
+-			destination = w.Dest
+-		}
+-		bb.Release()
+-		return ToSocksaddr(destination), nil
+-	}
+-}
+-
+-func (w *PacketConnWrapper) WritePacket(buffer *B.Buffer, destination M.Socksaddr) (err error) {
+-	w.T.Update()
+-	defer func() {
+-		if err != nil {
+-			// downlinkonly
+-			w.T.SetTimeout(5 * time.Second)
+-		}
+-	}()
+-	endpoint, err := ToDestination(destination, net.Network_UDP)
+-	if err != nil {
+-		return err
+-	}
+-	vBuf := buf.New()
+-	vBuf.Write(buffer.Bytes())
+-	vBuf.UDP = &endpoint
+-	return w.WriteMultiBuffer(buf.MultiBuffer{vBuf})
+-}
+-
+-func (w *PacketConnWrapper) Close() error {
+-	buf.ReleaseMulti(w.cached)
+-	return nil
+-}
+diff --git a/common/singbridge/pipe.go b/common/singbridge/pipe.go
+deleted file mode 100644
+index 94c5ee0c1827..000000000000
+--- a/common/singbridge/pipe.go
++++ /dev/null
+@@ -1,81 +0,0 @@
+-package singbridge
+-
+-import (
+-	"context"
+-	"io"
+-	"net"
+-	"time"
+-
+-	"github.com/sagernet/sing/common/bufio"
+-	"github.com/xtls/xray-core/common"
+-	"github.com/xtls/xray-core/common/buf"
+-	"github.com/xtls/xray-core/common/signal"
+-	"github.com/xtls/xray-core/transport"
+-)
+-
+-func CopyConn(ctx context.Context, inboundConn net.Conn, link *transport.Link, serverConn net.Conn) error {
+-	conn := &PipeConnWrapper{
+-		W:    link.Writer,
+-		Conn: inboundConn,
+-	}
+-	if ir, ok := link.Reader.(io.Reader); ok {
+-		conn.R = ir
+-	} else {
+-		conn.R = &buf.BufferedReader{Reader: link.Reader}
+-	}
+-	cancel := func() {
+-		common.Interrupt(link.Reader)
+-		common.Interrupt(serverConn)
+-	}
+-	conn.T = signal.CancelAfterInactivity(ctx, cancel, 300*time.Second)
+-	return ReturnError(bufio.CopyConn(ctx, conn, serverConn))
+-}
+-
+-type PipeConnWrapper struct {
+-	R io.Reader
+-	W buf.Writer
+-	net.Conn
+-
+-	// A simple patch to avoid goroutine leak since sing infra cannot awake read block by write err
+-	T *signal.ActivityTimer
+-}
+-
+-func (w *PipeConnWrapper) Close() error {
+-	return nil
+-}
+-
+-func (w *PipeConnWrapper) Read(b []byte) (n int, err error) {
+-	w.T.Update()
+-	n, err = w.R.Read(b)
+-	if err != nil {
+-		// uplinkonly
+-		w.T.SetTimeout(2 * time.Second)
+-	}
+-	return
+-}
+-
+-func (w *PipeConnWrapper) Write(p []byte) (n int, err error) {
+-	w.T.Update()
+-	n = len(p)
+-	var mb buf.MultiBuffer
+-	pLen := len(p)
+-	for pLen > 0 {
+-		buffer := buf.New()
+-		if pLen > buf.Size {
+-			_, err = buffer.Write(p[:buf.Size])
+-			p = p[buf.Size:]
+-		} else {
+-			buffer.Write(p)
+-		}
+-		pLen -= int(buffer.Len())
+-		mb = append(mb, buffer)
+-	}
+-	err = w.W.WriteMultiBuffer(mb)
+-	if err != nil {
+-		n = 0
+-		buf.ReleaseMulti(mb)
+-		// downlinkonly
+-		w.T.SetTimeout(5 * time.Second)
+-	}
+-	return
+-}
+diff --git a/common/singbridge/reader.go b/common/singbridge/reader.go
+deleted file mode 100644
+index 1ace1845f031..000000000000
+--- a/common/singbridge/reader.go
++++ /dev/null
+@@ -1,66 +0,0 @@
+-package singbridge
+-
+-import (
+-	"time"
+-
+-	"github.com/sagernet/sing/common"
+-	"github.com/sagernet/sing/common/bufio"
+-	N "github.com/sagernet/sing/common/network"
+-	"github.com/xtls/xray-core/common/buf"
+-	"github.com/xtls/xray-core/common/net"
+-)
+-
+-var (
+-	_ buf.Reader        = (*Conn)(nil)
+-	_ buf.TimeoutReader = (*Conn)(nil)
+-	_ buf.Writer        = (*Conn)(nil)
+-)
+-
+-type Conn struct {
+-	net.Conn
+-	writer N.VectorisedWriter
+-}
+-
+-func NewConn(conn net.Conn) *Conn {
+-	writer, _ := bufio.CreateVectorisedWriter(conn)
+-	return &Conn{
+-		Conn:   conn,
+-		writer: writer,
+-	}
+-}
+-
+-func (c *Conn) ReadMultiBuffer() (buf.MultiBuffer, error) {
+-	buffer, err := buf.ReadBuffer(c.Conn)
+-	if err != nil {
+-		return nil, err
+-	}
+-	return buf.MultiBuffer{buffer}, nil
+-}
+-
+-func (c *Conn) ReadMultiBufferTimeout(duration time.Duration) (buf.MultiBuffer, error) {
+-	err := c.SetReadDeadline(time.Now().Add(duration))
+-	if err != nil {
+-		return nil, err
+-	}
+-	defer c.SetReadDeadline(time.Time{})
+-	return c.ReadMultiBuffer()
+-}
+-
+-func (c *Conn) WriteMultiBuffer(bufferList buf.MultiBuffer) error {
+-	defer buf.ReleaseMulti(bufferList)
+-	if c.writer != nil {
+-		bytesList := make([][]byte, len(bufferList))
+-		for i, buffer := range bufferList {
+-			bytesList[i] = buffer.Bytes()
+-		}
+-		return common.Error(bufio.WriteVectorised(c.writer, bytesList))
+-	}
+-	// Since this conn is only used by tun, we don't force buffer writes to merge.
+-	for _, buffer := range bufferList {
+-		_, err := c.Conn.Write(buffer.Bytes())
+-		if err != nil {
+-			return err
+-		}
+-	}
+-	return nil
+-}
+diff --git a/go.mod b/go.mod
+index be24f79b3331..097984025eb6 100644
+--- a/go.mod
++++ b/go.mod
+@@ -18,8 +18,6 @@ require (
+ 	github.com/pires/go-proxyproto v0.15.0
+ 	github.com/refraction-networking/utls v1.8.3-0.20260301010127-aa6edf4b11af
+ 	github.com/robfig/cron/v3 v3.0.1
+-	github.com/sagernet/sing v0.5.1
+-	github.com/sagernet/sing-shadowsocks v0.2.7
+ 	github.com/stretchr/testify v1.12.1
+ 	github.com/vishvananda/netlink v1.3.1
+ 	github.com/xtls/reality v0.0.0-20260908062103-8cdf7bf9c7f0
+diff --git a/go.sum b/go.sum
+index f906979488a4..261a5736a8bd 100644
+--- a/go.sum
++++ b/go.sum
+@@ -76,10 +76,6 @@ github.com/robfig/cron/v3 v3.0.1 h1:WdRxkvbJztn8LMz/QEvLN5sBU+xKpSqwwUO1Pjr4qDs=
+ github.com/robfig/cron/v3 v3.0.1/go.mod h1:eQICP3HwyT7UooqI/z+Ov+PtYAWygg1TEWWzGIFLtro=
+ github.com/rogpeppe/go-internal v1.16.0 h1:O9DK+vNMDVGLr2BeZqmpLeMjiMNkuXfcqntWbZV6S5g=
+ github.com/rogpeppe/go-internal v1.16.0/go.mod h1:DrUVZyrJU+txYW5/1kwtXQSMFio52ZOxX7yM1VHvnxs=
+-github.com/sagernet/sing v0.5.1 h1:mhL/MZVq0TjuvHcpYcFtmSD1BFOxZ/+8ofbNZcg1k1Y=
+-github.com/sagernet/sing v0.5.1/go.mod h1:ARkL0gM13/Iv5VCZmci/NuoOlePoIsW0m7BWfln/Hak=
+-github.com/sagernet/sing-shadowsocks v0.2.7 h1:zaopR1tbHEw5Nk6FAkM05wCslV6ahVegEZaKMv9ipx8=
+-github.com/sagernet/sing-shadowsocks v0.2.7/go.mod h1:0rIKJZBR65Qi0zwdKezt4s57y/Tl1ofkaq6NlkzVuyE=
+ github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
+ github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUmoNlxoYthg=
+ github.com/vishvananda/netlink v1.3.1 h1:3AEMt62VKqz90r0tmNhog0r/PpWKmrEShJU0wJW6bV0=
+diff --git a/infra/conf/shadowsocks.go b/infra/conf/shadowsocks.go
+index 18451ab5c978..92bfbd9b2d43 100644
+--- a/infra/conf/shadowsocks.go
++++ b/infra/conf/shadowsocks.go
+@@ -3,14 +3,11 @@ package conf
+ import (
+ 	"strings"
+ 
+-	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
+-	C "github.com/sagernet/sing/common"
+ 	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/protocol"
+ 	"github.com/xtls/xray-core/common/serial"
+ 	"github.com/xtls/xray-core/common/task"
+ 	"github.com/xtls/xray-core/proxy/shadowsocks"
+-	"github.com/xtls/xray-core/proxy/shadowsocks_2022"
+ 	"google.golang.org/protobuf/proto"
+ )
+ 
+@@ -55,10 +52,6 @@ func (v *ShadowsocksServerConfig) Build() (proto.Message, error) {
+ 		v.Users = v.Clients
+ 	}
+ 
+-	if C.Contains(shadowaead_2022.List, v.Cipher) {
+-		return buildShadowsocks2022(v)
+-	}
+-
+ 	config := new(shadowsocks.ServerConfig)
+ 	config.Network = v.NetworkList.Build()
+ 
+@@ -110,72 +103,6 @@ func (v *ShadowsocksServerConfig) Build() (proto.Message, error) {
+ 	return config, nil
+ }
+ 
+-func buildShadowsocks2022(v *ShadowsocksServerConfig) (proto.Message, error) {
+-	if len(v.Users) == 0 {
+-		config := new(shadowsocks_2022.ServerConfig)
+-		config.Method = v.Cipher
+-		config.Key = v.Password
+-		config.Network = v.NetworkList.Build()
+-		config.Email = v.Email
+-		return config, nil
+-	}
+-
+-	if v.Cipher == "" {
+-		return nil, errors.New("shadowsocks 2022 (multi-user): missing server method")
+-	}
+-	if !strings.Contains(v.Cipher, "aes") {
+-		return nil, errors.New("shadowsocks 2022 (multi-user): only blake3-aes-*-gcm methods are supported")
+-	}
+-
+-	if v.Users[0].Address == nil {
+-		config := new(shadowsocks_2022.MultiUserServerConfig)
+-		config.Method = v.Cipher
+-		config.Key = v.Password
+-		config.Network = v.NetworkList.Build()
+-
+-		config.Users = make([]*protocol.User, len(v.Users))
+-		processUser := func(idx int) error {
+-			user := v.Users[idx]
+-			if user.Cipher != "" {
+-				return errors.New("shadowsocks 2022 (multi-user): users must have empty method")
+-			}
+-			account := &shadowsocks_2022.Account{
+-				Key: user.Password,
+-			}
+-			config.Users[idx] = &protocol.User{
+-				Email:   user.Email,
+-				Level:   uint32(user.Level),
+-				Account: serial.ToTypedMessage(account),
+-			}
+-			return nil
+-		}
+-		if err := task.ParallelForN(len(v.Users), processUser); err != nil {
+-			return nil, err
+-		}
+-		return config, nil
+-	}
+-
+-	config := new(shadowsocks_2022.RelayServerConfig)
+-	config.Method = v.Cipher
+-	config.Key = v.Password
+-	config.Network = v.NetworkList.Build()
+-	for _, user := range v.Users {
+-		if user.Cipher != "" {
+-			return nil, errors.New("shadowsocks 2022 (relay): users must have empty method")
+-		}
+-		if user.Address == nil {
+-			return nil, errors.New("shadowsocks 2022 (relay): all users must have relay address")
+-		}
+-		config.Destinations = append(config.Destinations, &shadowsocks_2022.RelayDestination{
+-			Key:     user.Password,
+-			Email:   user.Email,
+-			Address: user.Address.Build(),
+-			Port:    uint32(user.Port),
+-		})
+-	}
+-	return config, nil
+-}
+-
+ type ShadowsocksServerTarget struct {
+ 	Address  *Address `json:"address"`
+ 	Port     uint16   `json:"port"`
+@@ -214,33 +141,8 @@ func (v *ShadowsocksClientConfig) Build() (proto.Message, error) {
+ 		return nil, errors.New(`Shadowsocks settings: "servers" should have one and only one member. Multiple endpoints in "servers" should use multiple Shadowsocks outbounds and routing balancer instead`)
+ 	}
+ 
+-	if len(v.Servers) == 1 {
+-		server := v.Servers[0]
+-		if C.Contains(shadowaead_2022.List, server.Cipher) {
+-			if server.Address == nil {
+-				return nil, errors.New("Shadowsocks server address is not set.")
+-			}
+-			if server.Port == 0 {
+-				return nil, errors.New("Invalid Shadowsocks port.")
+-			}
+-			if server.Password == "" {
+-				return nil, errors.New("Shadowsocks password is not specified.")
+-			}
+-
+-			config := new(shadowsocks_2022.ClientConfig)
+-			config.Address = server.Address.Build()
+-			config.Port = uint32(server.Port)
+-			config.Method = server.Cipher
+-			config.Key = server.Password
+-			return config, nil
+-		}
+-	}
+-
+ 	config := new(shadowsocks.ClientConfig)
+ 	for _, server := range v.Servers {
+-		if C.Contains(shadowaead_2022.List, server.Cipher) {
+-			return nil, errors.New("Shadowsocks 2022 accept no multi servers")
+-		}
+ 		if server.Address == nil {
+ 			return nil, errors.New("Shadowsocks server address is not set.")
+ 		}
+diff --git a/main/commands/all/api/inbound_user_add.go b/main/commands/all/api/inbound_user_add.go
+index 81afc0d29e31..bb4be183ca7b 100644
+--- a/main/commands/all/api/inbound_user_add.go
++++ b/main/commands/all/api/inbound_user_add.go
+@@ -13,7 +13,6 @@ import (
+ 	"github.com/xtls/xray-core/infra/conf"
+ 	"github.com/xtls/xray-core/infra/conf/serial"
+ 	"github.com/xtls/xray-core/proxy/shadowsocks"
+-	"github.com/xtls/xray-core/proxy/shadowsocks_2022"
+ 	"github.com/xtls/xray-core/proxy/trojan"
+ 	vlessin "github.com/xtls/xray-core/proxy/vless/inbound"
+ 	vmessin "github.com/xtls/xray-core/proxy/vmess/inbound"
+@@ -86,8 +85,6 @@ func extractInboundUsers(inb *core.InboundHandlerConfig) []*protocol.User {
+ 		return ty.Users
+ 	case *shadowsocks.ServerConfig:
+ 		return ty.Users
+-	case *shadowsocks_2022.MultiUserServerConfig:
+-		return ty.Users
+ 	default:
+ 		fmt.Println("unsupported inbound type")
+ 	}
+diff --git a/proxy/freedom/freedom.go b/proxy/freedom/freedom.go
+index 47a33b560709..3b7bcc7dbca8 100644
+--- a/proxy/freedom/freedom.go
++++ b/proxy/freedom/freedom.go
+@@ -4,7 +4,6 @@ import (
+ 	"context"
+ 	"crypto/rand"
+ 	"io"
+-	"strings"
+ 	"sync/atomic"
+ 	"time"
+ 
+@@ -164,12 +163,9 @@ func getDefaultFinalRule(inbound *session.Inbound) *FinalRule {
+ 	switch inbound.Name {
+ 	case "vless-reverse":
+ 		return defaultBlockAllRule
+-	case "vless", "vmess", "trojan", "hysteria", "wireguard":
++	case "vless", "vmess", "trojan", "hysteria", "wireguard", "shadowsocks":
+ 		return defaultBlockPrivateRule
+ 	default:
+-		if strings.HasPrefix(inbound.Name, "shadowsocks") {
+-			return defaultBlockPrivateRule
+-		}
+ 	}
+ 	return nil
+ }
+diff --git a/proxy/shadowsocks_2022/config.go b/proxy/shadowsocks_2022/config.go
+deleted file mode 100644
+index 9ddd2cf88bfc..000000000000
+--- a/proxy/shadowsocks_2022/config.go
++++ /dev/null
+@@ -1,33 +0,0 @@
+-package shadowsocks_2022
+-
+-import (
+-	"google.golang.org/protobuf/proto"
+-
+-	"github.com/xtls/xray-core/common/protocol"
+-)
+-
+-// MemoryAccount is an account type converted from Account.
+-type MemoryAccount struct {
+-	Key string
+-}
+-
+-// AsAccount implements protocol.AsAccount.
+-func (u *Account) AsAccount() (protocol.Account, error) {
+-	return &MemoryAccount{
+-		Key: u.GetKey(),
+-	}, nil
+-}
+-
+-// Equals implements protocol.Account.Equals().
+-func (a *MemoryAccount) Equals(another protocol.Account) bool {
+-	if account, ok := another.(*MemoryAccount); ok {
+-		return a.Key == account.Key
+-	}
+-	return false
+-}
+-
+-func (a *MemoryAccount) ToProto() proto.Message {
+-	return &Account{
+-		Key: a.Key,
+-	}
+-}
+diff --git a/proxy/shadowsocks_2022/config.pb.go b/proxy/shadowsocks_2022/config.pb.go
+deleted file mode 100644
+index 7213bd2d3676..000000000000
+--- a/proxy/shadowsocks_2022/config.pb.go
++++ /dev/null
+@@ -1,523 +0,0 @@
+-// Code generated by protoc-gen-go. DO NOT EDIT.
+-// versions:
+-// 	protoc-gen-go v1.36.11
+-// 	protoc        v6.33.5
+-// source: proxy/shadowsocks_2022/config.proto
+-
+-package shadowsocks_2022
+-
+-import (
+-	net "github.com/xtls/xray-core/common/net"
+-	protocol "github.com/xtls/xray-core/common/protocol"
+-	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+-	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+-	reflect "reflect"
+-	sync "sync"
+-	unsafe "unsafe"
+-)
+-
+-const (
+-	// Verify that this generated code is sufficiently up-to-date.
+-	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
+-	// Verify that runtime/protoimpl is sufficiently up-to-date.
+-	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
+-)
+-
+-type ServerConfig struct {
+-	state         protoimpl.MessageState `protogen:"open.v1"`
+-	Method        string                 `protobuf:"bytes,1,opt,name=method,proto3" json:"method,omitempty"`
+-	Key           string                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
+-	Email         string                 `protobuf:"bytes,3,opt,name=email,proto3" json:"email,omitempty"`
+-	Level         int32                  `protobuf:"varint,4,opt,name=level,proto3" json:"level,omitempty"`
+-	Network       []net.Network          `protobuf:"varint,5,rep,packed,name=network,proto3,enum=xray.common.net.Network" json:"network,omitempty"`
+-	unknownFields protoimpl.UnknownFields
+-	sizeCache     protoimpl.SizeCache
+-}
+-
+-func (x *ServerConfig) Reset() {
+-	*x = ServerConfig{}
+-	mi := &file_proxy_shadowsocks_2022_config_proto_msgTypes[0]
+-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+-	ms.StoreMessageInfo(mi)
+-}
+-
+-func (x *ServerConfig) String() string {
+-	return protoimpl.X.MessageStringOf(x)
+-}
+-
+-func (*ServerConfig) ProtoMessage() {}
+-
+-func (x *ServerConfig) ProtoReflect() protoreflect.Message {
+-	mi := &file_proxy_shadowsocks_2022_config_proto_msgTypes[0]
+-	if x != nil {
+-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+-		if ms.LoadMessageInfo() == nil {
+-			ms.StoreMessageInfo(mi)
+-		}
+-		return ms
+-	}
+-	return mi.MessageOf(x)
+-}
+-
+-// Deprecated: Use ServerConfig.ProtoReflect.Descriptor instead.
+-func (*ServerConfig) Descriptor() ([]byte, []int) {
+-	return file_proxy_shadowsocks_2022_config_proto_rawDescGZIP(), []int{0}
+-}
+-
+-func (x *ServerConfig) GetMethod() string {
+-	if x != nil {
+-		return x.Method
+-	}
+-	return ""
+-}
+-
+-func (x *ServerConfig) GetKey() string {
+-	if x != nil {
+-		return x.Key
+-	}
+-	return ""
+-}
+-
+-func (x *ServerConfig) GetEmail() string {
+-	if x != nil {
+-		return x.Email
+-	}
+-	return ""
+-}
+-
+-func (x *ServerConfig) GetLevel() int32 {
+-	if x != nil {
+-		return x.Level
+-	}
+-	return 0
+-}
+-
+-func (x *ServerConfig) GetNetwork() []net.Network {
+-	if x != nil {
+-		return x.Network
+-	}
+-	return nil
+-}
+-
+-type MultiUserServerConfig struct {
+-	state         protoimpl.MessageState `protogen:"open.v1"`
+-	Method        string                 `protobuf:"bytes,1,opt,name=method,proto3" json:"method,omitempty"`
+-	Key           string                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
+-	Users         []*protocol.User       `protobuf:"bytes,3,rep,name=users,proto3" json:"users,omitempty"`
+-	Network       []net.Network          `protobuf:"varint,4,rep,packed,name=network,proto3,enum=xray.common.net.Network" json:"network,omitempty"`
+-	unknownFields protoimpl.UnknownFields
+-	sizeCache     protoimpl.SizeCache
+-}
+-
+-func (x *MultiUserServerConfig) Reset() {
+-	*x = MultiUserServerConfig{}
+-	mi := &file_proxy_shadowsocks_2022_config_proto_msgTypes[1]
+-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+-	ms.StoreMessageInfo(mi)
+-}
+-
+-func (x *MultiUserServerConfig) String() string {
+-	return protoimpl.X.MessageStringOf(x)
+-}
+-
+-func (*MultiUserServerConfig) ProtoMessage() {}
+-
+-func (x *MultiUserServerConfig) ProtoReflect() protoreflect.Message {
+-	mi := &file_proxy_shadowsocks_2022_config_proto_msgTypes[1]
+-	if x != nil {
+-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+-		if ms.LoadMessageInfo() == nil {
+-			ms.StoreMessageInfo(mi)
+-		}
+-		return ms
+-	}
+-	return mi.MessageOf(x)
+-}
+-
+-// Deprecated: Use MultiUserServerConfig.ProtoReflect.Descriptor instead.
+-func (*MultiUserServerConfig) Descriptor() ([]byte, []int) {
+-	return file_proxy_shadowsocks_2022_config_proto_rawDescGZIP(), []int{1}
+-}
+-
+-func (x *MultiUserServerConfig) GetMethod() string {
+-	if x != nil {
+-		return x.Method
+-	}
+-	return ""
+-}
+-
+-func (x *MultiUserServerConfig) GetKey() string {
+-	if x != nil {
+-		return x.Key
+-	}
+-	return ""
+-}
+-
+-func (x *MultiUserServerConfig) GetUsers() []*protocol.User {
+-	if x != nil {
+-		return x.Users
+-	}
+-	return nil
+-}
+-
+-func (x *MultiUserServerConfig) GetNetwork() []net.Network {
+-	if x != nil {
+-		return x.Network
+-	}
+-	return nil
+-}
+-
+-type RelayDestination struct {
+-	state         protoimpl.MessageState `protogen:"open.v1"`
+-	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+-	Address       *net.IPOrDomain        `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
+-	Port          uint32                 `protobuf:"varint,3,opt,name=port,proto3" json:"port,omitempty"`
+-	Email         string                 `protobuf:"bytes,4,opt,name=email,proto3" json:"email,omitempty"`
+-	Level         int32                  `protobuf:"varint,5,opt,name=level,proto3" json:"level,omitempty"`
+-	unknownFields protoimpl.UnknownFields
+-	sizeCache     protoimpl.SizeCache
+-}
+-
+-func (x *RelayDestination) Reset() {
+-	*x = RelayDestination{}
+-	mi := &file_proxy_shadowsocks_2022_config_proto_msgTypes[2]
+-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+-	ms.StoreMessageInfo(mi)
+-}
+-
+-func (x *RelayDestination) String() string {
+-	return protoimpl.X.MessageStringOf(x)
+-}
+-
+-func (*RelayDestination) ProtoMessage() {}
+-
+-func (x *RelayDestination) ProtoReflect() protoreflect.Message {
+-	mi := &file_proxy_shadowsocks_2022_config_proto_msgTypes[2]
+-	if x != nil {
+-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+-		if ms.LoadMessageInfo() == nil {
+-			ms.StoreMessageInfo(mi)
+-		}
+-		return ms
+-	}
+-	return mi.MessageOf(x)
+-}
+-
+-// Deprecated: Use RelayDestination.ProtoReflect.Descriptor instead.
+-func (*RelayDestination) Descriptor() ([]byte, []int) {
+-	return file_proxy_shadowsocks_2022_config_proto_rawDescGZIP(), []int{2}
+-}
+-
+-func (x *RelayDestination) GetKey() string {
+-	if x != nil {
+-		return x.Key
+-	}
+-	return ""
+-}
+-
+-func (x *RelayDestination) GetAddress() *net.IPOrDomain {
+-	if x != nil {
+-		return x.Address
+-	}
+-	return nil
+-}
+-
+-func (x *RelayDestination) GetPort() uint32 {
+-	if x != nil {
+-		return x.Port
+-	}
+-	return 0
+-}
+-
+-func (x *RelayDestination) GetEmail() string {
+-	if x != nil {
+-		return x.Email
+-	}
+-	return ""
+-}
+-
+-func (x *RelayDestination) GetLevel() int32 {
+-	if x != nil {
+-		return x.Level
+-	}
+-	return 0
+-}
+-
+-type RelayServerConfig struct {
+-	state         protoimpl.MessageState `protogen:"open.v1"`
+-	Method        string                 `protobuf:"bytes,1,opt,name=method,proto3" json:"method,omitempty"`
+-	Key           string                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
+-	Destinations  []*RelayDestination    `protobuf:"bytes,3,rep,name=destinations,proto3" json:"destinations,omitempty"`
+-	Network       []net.Network          `protobuf:"varint,4,rep,packed,name=network,proto3,enum=xray.common.net.Network" json:"network,omitempty"`
+-	unknownFields protoimpl.UnknownFields
+-	sizeCache     protoimpl.SizeCache
+-}
+-
+-func (x *RelayServerConfig) Reset() {
+-	*x = RelayServerConfig{}
+-	mi := &file_proxy_shadowsocks_2022_config_proto_msgTypes[3]
+-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+-	ms.StoreMessageInfo(mi)
+-}
+-
+-func (x *RelayServerConfig) String() string {
+-	return protoimpl.X.MessageStringOf(x)
+-}
+-
+-func (*RelayServerConfig) ProtoMessage() {}
+-
+-func (x *RelayServerConfig) ProtoReflect() protoreflect.Message {
+-	mi := &file_proxy_shadowsocks_2022_config_proto_msgTypes[3]
+-	if x != nil {
+-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+-		if ms.LoadMessageInfo() == nil {
+-			ms.StoreMessageInfo(mi)
+-		}
+-		return ms
+-	}
+-	return mi.MessageOf(x)
+-}
+-
+-// Deprecated: Use RelayServerConfig.ProtoReflect.Descriptor instead.
+-func (*RelayServerConfig) Descriptor() ([]byte, []int) {
+-	return file_proxy_shadowsocks_2022_config_proto_rawDescGZIP(), []int{3}
+-}
+-
+-func (x *RelayServerConfig) GetMethod() string {
+-	if x != nil {
+-		return x.Method
+-	}
+-	return ""
+-}
+-
+-func (x *RelayServerConfig) GetKey() string {
+-	if x != nil {
+-		return x.Key
+-	}
+-	return ""
+-}
+-
+-func (x *RelayServerConfig) GetDestinations() []*RelayDestination {
+-	if x != nil {
+-		return x.Destinations
+-	}
+-	return nil
+-}
+-
+-func (x *RelayServerConfig) GetNetwork() []net.Network {
+-	if x != nil {
+-		return x.Network
+-	}
+-	return nil
+-}
+-
+-type Account struct {
+-	state         protoimpl.MessageState `protogen:"open.v1"`
+-	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+-	unknownFields protoimpl.UnknownFields
+-	sizeCache     protoimpl.SizeCache
+-}
+-
+-func (x *Account) Reset() {
+-	*x = Account{}
+-	mi := &file_proxy_shadowsocks_2022_config_proto_msgTypes[4]
+-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+-	ms.StoreMessageInfo(mi)
+-}
+-
+-func (x *Account) String() string {
+-	return protoimpl.X.MessageStringOf(x)
+-}
+-
+-func (*Account) ProtoMessage() {}
+-
+-func (x *Account) ProtoReflect() protoreflect.Message {
+-	mi := &file_proxy_shadowsocks_2022_config_proto_msgTypes[4]
+-	if x != nil {
+-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+-		if ms.LoadMessageInfo() == nil {
+-			ms.StoreMessageInfo(mi)
+-		}
+-		return ms
+-	}
+-	return mi.MessageOf(x)
+-}
+-
+-// Deprecated: Use Account.ProtoReflect.Descriptor instead.
+-func (*Account) Descriptor() ([]byte, []int) {
+-	return file_proxy_shadowsocks_2022_config_proto_rawDescGZIP(), []int{4}
+-}
+-
+-func (x *Account) GetKey() string {
+-	if x != nil {
+-		return x.Key
+-	}
+-	return ""
+-}
+-
+-type ClientConfig struct {
+-	state         protoimpl.MessageState `protogen:"open.v1"`
+-	Address       *net.IPOrDomain        `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
+-	Port          uint32                 `protobuf:"varint,2,opt,name=port,proto3" json:"port,omitempty"`
+-	Method        string                 `protobuf:"bytes,3,opt,name=method,proto3" json:"method,omitempty"`
+-	Key           string                 `protobuf:"bytes,4,opt,name=key,proto3" json:"key,omitempty"`
+-	unknownFields protoimpl.UnknownFields
+-	sizeCache     protoimpl.SizeCache
+-}
+-
+-func (x *ClientConfig) Reset() {
+-	*x = ClientConfig{}
+-	mi := &file_proxy_shadowsocks_2022_config_proto_msgTypes[5]
+-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+-	ms.StoreMessageInfo(mi)
+-}
+-
+-func (x *ClientConfig) String() string {
+-	return protoimpl.X.MessageStringOf(x)
+-}
+-
+-func (*ClientConfig) ProtoMessage() {}
+-
+-func (x *ClientConfig) ProtoReflect() protoreflect.Message {
+-	mi := &file_proxy_shadowsocks_2022_config_proto_msgTypes[5]
+-	if x != nil {
+-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+-		if ms.LoadMessageInfo() == nil {
+-			ms.StoreMessageInfo(mi)
+-		}
+-		return ms
+-	}
+-	return mi.MessageOf(x)
+-}
+-
+-// Deprecated: Use ClientConfig.ProtoReflect.Descriptor instead.
+-func (*ClientConfig) Descriptor() ([]byte, []int) {
+-	return file_proxy_shadowsocks_2022_config_proto_rawDescGZIP(), []int{5}
+-}
+-
+-func (x *ClientConfig) GetAddress() *net.IPOrDomain {
+-	if x != nil {
+-		return x.Address
+-	}
+-	return nil
+-}
+-
+-func (x *ClientConfig) GetPort() uint32 {
+-	if x != nil {
+-		return x.Port
+-	}
+-	return 0
+-}
+-
+-func (x *ClientConfig) GetMethod() string {
+-	if x != nil {
+-		return x.Method
+-	}
+-	return ""
+-}
+-
+-func (x *ClientConfig) GetKey() string {
+-	if x != nil {
+-		return x.Key
+-	}
+-	return ""
+-}
+-
+-var File_proxy_shadowsocks_2022_config_proto protoreflect.FileDescriptor
+-
+-const file_proxy_shadowsocks_2022_config_proto_rawDesc = "" +
+-	"\n" +
+-	"#proxy/shadowsocks_2022/config.proto\x12\x1bxray.proxy.shadowsocks_2022\x1a\x18common/net/network.proto\x1a\x18common/net/address.proto\x1a\x1acommon/protocol/user.proto\"\x98\x01\n" +
+-	"\fServerConfig\x12\x16\n" +
+-	"\x06method\x18\x01 \x01(\tR\x06method\x12\x10\n" +
+-	"\x03key\x18\x02 \x01(\tR\x03key\x12\x14\n" +
+-	"\x05email\x18\x03 \x01(\tR\x05email\x12\x14\n" +
+-	"\x05level\x18\x04 \x01(\x05R\x05level\x122\n" +
+-	"\anetwork\x18\x05 \x03(\x0e2\x18.xray.common.net.NetworkR\anetwork\"\xa7\x01\n" +
+-	"\x15MultiUserServerConfig\x12\x16\n" +
+-	"\x06method\x18\x01 \x01(\tR\x06method\x12\x10\n" +
+-	"\x03key\x18\x02 \x01(\tR\x03key\x120\n" +
+-	"\x05users\x18\x03 \x03(\v2\x1a.xray.common.protocol.UserR\x05users\x122\n" +
+-	"\anetwork\x18\x04 \x03(\x0e2\x18.xray.common.net.NetworkR\anetwork\"\x9b\x01\n" +
+-	"\x10RelayDestination\x12\x10\n" +
+-	"\x03key\x18\x01 \x01(\tR\x03key\x125\n" +
+-	"\aaddress\x18\x02 \x01(\v2\x1b.xray.common.net.IPOrDomainR\aaddress\x12\x12\n" +
+-	"\x04port\x18\x03 \x01(\rR\x04port\x12\x14\n" +
+-	"\x05email\x18\x04 \x01(\tR\x05email\x12\x14\n" +
+-	"\x05level\x18\x05 \x01(\x05R\x05level\"\xc4\x01\n" +
+-	"\x11RelayServerConfig\x12\x16\n" +
+-	"\x06method\x18\x01 \x01(\tR\x06method\x12\x10\n" +
+-	"\x03key\x18\x02 \x01(\tR\x03key\x12Q\n" +
+-	"\fdestinations\x18\x03 \x03(\v2-.xray.proxy.shadowsocks_2022.RelayDestinationR\fdestinations\x122\n" +
+-	"\anetwork\x18\x04 \x03(\x0e2\x18.xray.common.net.NetworkR\anetwork\"\x1b\n" +
+-	"\aAccount\x12\x10\n" +
+-	"\x03key\x18\x01 \x01(\tR\x03key\"\x83\x01\n" +
+-	"\fClientConfig\x125\n" +
+-	"\aaddress\x18\x01 \x01(\v2\x1b.xray.common.net.IPOrDomainR\aaddress\x12\x12\n" +
+-	"\x04port\x18\x02 \x01(\rR\x04port\x12\x16\n" +
+-	"\x06method\x18\x03 \x01(\tR\x06method\x12\x10\n" +
+-	"\x03key\x18\x04 \x01(\tR\x03keyBr\n" +
+-	"\x1fcom.xray.proxy.shadowsocks_2022P\x01Z0github.com/xtls/xray-core/proxy/shadowsocks_2022\xaa\x02\x1aXray.Proxy.Shadowsocks2022b\x06proto3"
+-
+-var (
+-	file_proxy_shadowsocks_2022_config_proto_rawDescOnce sync.Once
+-	file_proxy_shadowsocks_2022_config_proto_rawDescData []byte
+-)
+-
+-func file_proxy_shadowsocks_2022_config_proto_rawDescGZIP() []byte {
+-	file_proxy_shadowsocks_2022_config_proto_rawDescOnce.Do(func() {
+-		file_proxy_shadowsocks_2022_config_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_proxy_shadowsocks_2022_config_proto_rawDesc), len(file_proxy_shadowsocks_2022_config_proto_rawDesc)))
+-	})
+-	return file_proxy_shadowsocks_2022_config_proto_rawDescData
+-}
+-
+-var file_proxy_shadowsocks_2022_config_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+-var file_proxy_shadowsocks_2022_config_proto_goTypes = []any{
+-	(*ServerConfig)(nil),          // 0: xray.proxy.shadowsocks_2022.ServerConfig
+-	(*MultiUserServerConfig)(nil), // 1: xray.proxy.shadowsocks_2022.MultiUserServerConfig
+-	(*RelayDestination)(nil),      // 2: xray.proxy.shadowsocks_2022.RelayDestination
+-	(*RelayServerConfig)(nil),     // 3: xray.proxy.shadowsocks_2022.RelayServerConfig
+-	(*Account)(nil),               // 4: xray.proxy.shadowsocks_2022.Account
+-	(*ClientConfig)(nil),          // 5: xray.proxy.shadowsocks_2022.ClientConfig
+-	(net.Network)(0),              // 6: xray.common.net.Network
+-	(*protocol.User)(nil),         // 7: xray.common.protocol.User
+-	(*net.IPOrDomain)(nil),        // 8: xray.common.net.IPOrDomain
+-}
+-var file_proxy_shadowsocks_2022_config_proto_depIdxs = []int32{
+-	6, // 0: xray.proxy.shadowsocks_2022.ServerConfig.network:type_name -> xray.common.net.Network
+-	7, // 1: xray.proxy.shadowsocks_2022.MultiUserServerConfig.users:type_name -> xray.common.protocol.User
+-	6, // 2: xray.proxy.shadowsocks_2022.MultiUserServerConfig.network:type_name -> xray.common.net.Network
+-	8, // 3: xray.proxy.shadowsocks_2022.RelayDestination.address:type_name -> xray.common.net.IPOrDomain
+-	2, // 4: xray.proxy.shadowsocks_2022.RelayServerConfig.destinations:type_name -> xray.proxy.shadowsocks_2022.RelayDestination
+-	6, // 5: xray.proxy.shadowsocks_2022.RelayServerConfig.network:type_name -> xray.common.net.Network
+-	8, // 6: xray.proxy.shadowsocks_2022.ClientConfig.address:type_name -> xray.common.net.IPOrDomain
+-	7, // [7:7] is the sub-list for method output_type
+-	7, // [7:7] is the sub-list for method input_type
+-	7, // [7:7] is the sub-list for extension type_name
+-	7, // [7:7] is the sub-list for extension extendee
+-	0, // [0:7] is the sub-list for field type_name
+-}
+-
+-func init() { file_proxy_shadowsocks_2022_config_proto_init() }
+-func file_proxy_shadowsocks_2022_config_proto_init() {
+-	if File_proxy_shadowsocks_2022_config_proto != nil {
+-		return
+-	}
+-	type x struct{}
+-	out := protoimpl.TypeBuilder{
+-		File: protoimpl.DescBuilder{
+-			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proxy_shadowsocks_2022_config_proto_rawDesc), len(file_proxy_shadowsocks_2022_config_proto_rawDesc)),
+-			NumEnums:      0,
+-			NumMessages:   6,
+-			NumExtensions: 0,
+-			NumServices:   0,
+-		},
+-		GoTypes:           file_proxy_shadowsocks_2022_config_proto_goTypes,
+-		DependencyIndexes: file_proxy_shadowsocks_2022_config_proto_depIdxs,
+-		MessageInfos:      file_proxy_shadowsocks_2022_config_proto_msgTypes,
+-	}.Build()
+-	File_proxy_shadowsocks_2022_config_proto = out.File
+-	file_proxy_shadowsocks_2022_config_proto_goTypes = nil
+-	file_proxy_shadowsocks_2022_config_proto_depIdxs = nil
+-}
+diff --git a/proxy/shadowsocks_2022/config.proto b/proxy/shadowsocks_2022/config.proto
+deleted file mode 100644
+index c73943d4ad29..000000000000
+--- a/proxy/shadowsocks_2022/config.proto
++++ /dev/null
+@@ -1,52 +0,0 @@
+-syntax = "proto3";
+-
+-package xray.proxy.shadowsocks_2022;
+-option csharp_namespace = "Xray.Proxy.Shadowsocks2022";
+-option go_package = "github.com/xtls/xray-core/proxy/shadowsocks_2022";
+-option java_package = "com.xray.proxy.shadowsocks_2022";
+-option java_multiple_files = true;
+-
+-import "common/net/network.proto";
+-import "common/net/address.proto";
+-import "common/protocol/user.proto";
+-
+-message ServerConfig {
+-  string method = 1;
+-  string key = 2;
+-  string email = 3;
+-  int32 level = 4;
+-  repeated xray.common.net.Network network = 5;
+-}
+-
+-message MultiUserServerConfig {
+-  string method = 1;
+-  string key = 2;
+-  repeated xray.common.protocol.User users = 3;
+-  repeated xray.common.net.Network network = 4;
+-}
+-
+-message RelayDestination {
+-  string key = 1;
+-  xray.common.net.IPOrDomain address = 2;
+-  uint32 port = 3;
+-  string email = 4;
+-  int32 level = 5;
+-}
+-
+-message RelayServerConfig {
+-  string method = 1;
+-  string key = 2;
+-  repeated RelayDestination destinations = 3;
+-  repeated xray.common.net.Network network = 4;
+-}
+-
+-message Account {
+-  string key = 1;
+-}
+-
+-message ClientConfig {
+-  xray.common.net.IPOrDomain address = 1;
+-  uint32 port = 2;
+-  string method = 3;
+-  string key = 4;
+-}
+diff --git a/proxy/shadowsocks_2022/inbound.go b/proxy/shadowsocks_2022/inbound.go
+deleted file mode 100644
+index edf9857c87fe..000000000000
+--- a/proxy/shadowsocks_2022/inbound.go
++++ /dev/null
+@@ -1,183 +0,0 @@
+-package shadowsocks_2022
+-
+-import (
+-	"context"
+-	"time"
+-
+-	shadowsocks "github.com/sagernet/sing-shadowsocks"
+-	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
+-	C "github.com/sagernet/sing/common"
+-	B "github.com/sagernet/sing/common/buf"
+-	"github.com/sagernet/sing/common/bufio"
+-	E "github.com/sagernet/sing/common/exceptions"
+-	M "github.com/sagernet/sing/common/metadata"
+-	N "github.com/sagernet/sing/common/network"
+-	"github.com/xtls/xray-core/common"
+-	"github.com/xtls/xray-core/common/buf"
+-	"github.com/xtls/xray-core/common/errors"
+-	"github.com/xtls/xray-core/common/log"
+-	"github.com/xtls/xray-core/common/net"
+-	"github.com/xtls/xray-core/common/protocol"
+-	"github.com/xtls/xray-core/common/session"
+-	"github.com/xtls/xray-core/common/signal"
+-	"github.com/xtls/xray-core/common/singbridge"
+-	"github.com/xtls/xray-core/features/routing"
+-	"github.com/xtls/xray-core/transport/internet/stat"
+-)
+-
+-func init() {
+-	common.Must(common.RegisterConfig((*ServerConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+-		return NewServer(ctx, config.(*ServerConfig))
+-	}))
+-}
+-
+-type Inbound struct {
+-	networks []net.Network
+-	service  shadowsocks.Service
+-	email    string
+-	level    int
+-}
+-
+-func NewServer(ctx context.Context, config *ServerConfig) (*Inbound, error) {
+-	networks := config.Network
+-	if len(networks) == 0 {
+-		networks = []net.Network{
+-			net.Network_TCP,
+-			net.Network_UDP,
+-		}
+-	}
+-	inbound := &Inbound{
+-		networks: networks,
+-		email:    config.Email,
+-		level:    int(config.Level),
+-	}
+-	if !C.Contains(shadowaead_2022.List, config.Method) {
+-		return nil, errors.New("unsupported method ", config.Method)
+-	}
+-	service, err := shadowaead_2022.NewServiceWithPassword(config.Method, config.Key, 500, inbound, nil)
+-	if err != nil {
+-		return nil, errors.New("create service").Base(err)
+-	}
+-	inbound.service = service
+-	return inbound, nil
+-}
+-
+-func (i *Inbound) Network() []net.Network {
+-	return i.networks
+-}
+-
+-func (i *Inbound) Process(ctx context.Context, network net.Network, connection stat.Connection, dispatcher routing.Dispatcher) error {
+-	inbound := session.InboundFromContext(ctx)
+-	inbound.Name = "shadowsocks-2022"
+-	inbound.CanSpliceCopy = 3
+-
+-	var metadata M.Metadata
+-	if inbound.Source.IsValid() {
+-		metadata.Source = M.ParseSocksaddr(inbound.Source.NetAddr())
+-	}
+-
+-	ctx = session.ContextWithDispatcher(ctx, dispatcher)
+-
+-	if network == net.Network_TCP {
+-		return singbridge.ReturnError(i.service.NewConnection(ctx, connection, metadata))
+-	} else {
+-		reader := buf.NewReader(connection)
+-		pc := &natPacketConn{connection}
+-		for {
+-			mb, err := reader.ReadMultiBuffer()
+-			if err != nil {
+-				buf.ReleaseMulti(mb)
+-				return singbridge.ReturnError(err)
+-			}
+-			for _, buffer := range mb {
+-				packet := B.As(buffer.Bytes()).ToOwned()
+-				buffer.Release()
+-				err = i.service.NewPacket(ctx, pc, packet, metadata)
+-				if err != nil {
+-					packet.Release()
+-					buf.ReleaseMulti(mb)
+-					return err
+-				}
+-			}
+-		}
+-	}
+-}
+-
+-func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
+-	inbound := session.InboundFromContext(ctx)
+-	inbound.User = &protocol.MemoryUser{
+-		Email: i.email,
+-		Level: uint32(i.level),
+-	}
+-	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
+-		From:   metadata.Source,
+-		To:     metadata.Destination,
+-		Status: log.AccessAccepted,
+-		Email:  i.email,
+-	})
+-	errors.LogInfo(ctx, "tunnelling request to tcp:", metadata.Destination)
+-	dispatcher := session.DispatcherFromContext(ctx)
+-	destination, err := singbridge.ToDestination(metadata.Destination, net.Network_TCP)
+-	if err != nil {
+-		return err
+-	}
+-	link, err := dispatcher.Dispatch(ctx, destination)
+-	if err != nil {
+-		return err
+-	}
+-	return singbridge.CopyConn(ctx, nil, link, conn)
+-}
+-
+-func (i *Inbound) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata M.Metadata) error {
+-	inbound := session.InboundFromContext(ctx)
+-	inbound.User = &protocol.MemoryUser{
+-		Email: i.email,
+-		Level: uint32(i.level),
+-	}
+-	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
+-		From:   metadata.Source,
+-		To:     metadata.Destination,
+-		Status: log.AccessAccepted,
+-		Email:  i.email,
+-	})
+-	errors.LogInfo(ctx, "tunnelling request to udp:", metadata.Destination)
+-	dispatcher := session.DispatcherFromContext(ctx)
+-	destination, err := singbridge.ToDestination(metadata.Destination, net.Network_UDP)
+-	if err != nil {
+-		return err
+-	}
+-	link, err := dispatcher.Dispatch(ctx, destination)
+-	if err != nil {
+-		return err
+-	}
+-	outConn := &singbridge.PacketConnWrapper{
+-		Reader: link.Reader,
+-		Writer: link.Writer,
+-		Dest:   destination,
+-		T: signal.CancelAfterInactivity(ctx, func() {
+-			common.Interrupt(link.Reader)
+-		}, 300*time.Second),
+-	}
+-	return bufio.CopyPacketConn(ctx, conn, outConn)
+-}
+-
+-func (i *Inbound) NewError(ctx context.Context, err error) {
+-	if E.IsClosed(err) {
+-		return
+-	}
+-	errors.LogWarning(ctx, err.Error())
+-}
+-
+-type natPacketConn struct {
+-	net.Conn
+-}
+-
+-func (c *natPacketConn) ReadPacket(buffer *B.Buffer) (addr M.Socksaddr, err error) {
+-	_, err = buffer.ReadFrom(c)
+-	return
+-}
+-
+-func (c *natPacketConn) WritePacket(buffer *B.Buffer, addr M.Socksaddr) error {
+-	_, err := buffer.WriteTo(c)
+-	return err
+-}
+diff --git a/proxy/shadowsocks_2022/inbound_multi.go b/proxy/shadowsocks_2022/inbound_multi.go
+deleted file mode 100644
+index d6d68c09ae29..000000000000
+--- a/proxy/shadowsocks_2022/inbound_multi.go
++++ /dev/null
+@@ -1,290 +0,0 @@
+-package shadowsocks_2022
+-
+-import (
+-	"context"
+-	"encoding/base64"
+-	"strconv"
+-	"strings"
+-	"sync"
+-	"time"
+-
+-	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
+-	C "github.com/sagernet/sing/common"
+-	A "github.com/sagernet/sing/common/auth"
+-	B "github.com/sagernet/sing/common/buf"
+-	"github.com/sagernet/sing/common/bufio"
+-	E "github.com/sagernet/sing/common/exceptions"
+-	M "github.com/sagernet/sing/common/metadata"
+-	N "github.com/sagernet/sing/common/network"
+-	"github.com/xtls/xray-core/common"
+-	"github.com/xtls/xray-core/common/buf"
+-	"github.com/xtls/xray-core/common/errors"
+-	"github.com/xtls/xray-core/common/log"
+-	"github.com/xtls/xray-core/common/net"
+-	"github.com/xtls/xray-core/common/protocol"
+-	"github.com/xtls/xray-core/common/session"
+-	"github.com/xtls/xray-core/common/signal"
+-	"github.com/xtls/xray-core/common/singbridge"
+-	"github.com/xtls/xray-core/common/uuid"
+-	"github.com/xtls/xray-core/features/routing"
+-	"github.com/xtls/xray-core/transport/internet/stat"
+-)
+-
+-func init() {
+-	common.Must(common.RegisterConfig((*MultiUserServerConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+-		return NewMultiServer(ctx, config.(*MultiUserServerConfig))
+-	}))
+-}
+-
+-type MultiUserInbound struct {
+-	sync.Mutex
+-	networks []net.Network
+-	users    []*protocol.MemoryUser
+-	service  *shadowaead_2022.MultiService[int]
+-}
+-
+-func NewMultiServer(ctx context.Context, config *MultiUserServerConfig) (*MultiUserInbound, error) {
+-	networks := config.Network
+-	if len(networks) == 0 {
+-		networks = []net.Network{
+-			net.Network_TCP,
+-			net.Network_UDP,
+-		}
+-	}
+-	memUsers := []*protocol.MemoryUser{}
+-	for i, user := range config.Users {
+-		if user.Email == "" {
+-			u := uuid.New()
+-			user.Email = "unnamed-user-" + strconv.Itoa(i) + "-" + u.String()
+-		}
+-		u, err := user.ToMemoryUser()
+-		if err != nil {
+-			return nil, errors.New("failed to get shadowsocks user").Base(err).AtError()
+-		}
+-		memUsers = append(memUsers, u)
+-	}
+-
+-	inbound := &MultiUserInbound{
+-		networks: networks,
+-		users:    memUsers,
+-	}
+-	if config.Key == "" {
+-		return nil, errors.New("missing key")
+-	}
+-	psk, err := base64.StdEncoding.DecodeString(config.Key)
+-	if err != nil {
+-		return nil, errors.New("parse config").Base(err)
+-	}
+-	service, err := shadowaead_2022.NewMultiService[int](config.Method, psk, 500, inbound, nil)
+-	if err != nil {
+-		return nil, errors.New("create service").Base(err)
+-	}
+-	err = service.UpdateUsersWithPasswords(
+-		C.MapIndexed(memUsers, func(index int, it *protocol.MemoryUser) int { return index }),
+-		C.Map(memUsers, func(it *protocol.MemoryUser) string { return it.Account.(*MemoryAccount).Key }),
+-	)
+-	if err != nil {
+-		return nil, errors.New("create service").Base(err)
+-	}
+-
+-	inbound.service = service
+-	return inbound, nil
+-}
+-
+-// AddUser implements proxy.UserManager.AddUser().
+-func (i *MultiUserInbound) AddUser(ctx context.Context, u *protocol.MemoryUser) error {
+-	i.Lock()
+-	defer i.Unlock()
+-
+-	if u.Email != "" {
+-		for idx := range i.users {
+-			if i.users[idx].Email == u.Email {
+-				return errors.New("User ", u.Email, " already exists.")
+-			}
+-		}
+-	}
+-	i.users = append(i.users, u)
+-
+-	// sync to multi service
+-	// Considering implements shadowsocks2022 in xray-core may have better performance.
+-	i.service.UpdateUsersWithPasswords(
+-		C.MapIndexed(i.users, func(index int, it *protocol.MemoryUser) int { return index }),
+-		C.Map(i.users, func(it *protocol.MemoryUser) string { return it.Account.(*MemoryAccount).Key }),
+-	)
+-
+-	return nil
+-}
+-
+-// RemoveUser implements proxy.UserManager.RemoveUser().
+-func (i *MultiUserInbound) RemoveUser(ctx context.Context, email string) error {
+-	if email == "" {
+-		return errors.New("Email must not be empty.")
+-	}
+-
+-	i.Lock()
+-	defer i.Unlock()
+-
+-	idx := -1
+-	for ii, u := range i.users {
+-		if strings.EqualFold(u.Email, email) {
+-			idx = ii
+-			break
+-		}
+-	}
+-
+-	if idx == -1 {
+-		return errors.New("User ", email, " not found.")
+-	}
+-
+-	ulen := len(i.users)
+-
+-	i.users[idx] = i.users[ulen-1]
+-	i.users[ulen-1] = nil
+-	i.users = i.users[:ulen-1]
+-
+-	// sync to multi service
+-	// Considering implements shadowsocks2022 in xray-core may have better performance.
+-	i.service.UpdateUsersWithPasswords(
+-		C.MapIndexed(i.users, func(index int, it *protocol.MemoryUser) int { return index }),
+-		C.Map(i.users, func(it *protocol.MemoryUser) string { return it.Account.(*MemoryAccount).Key }),
+-	)
+-
+-	return nil
+-}
+-
+-// GetUser implements proxy.UserManager.GetUser().
+-func (i *MultiUserInbound) GetUser(ctx context.Context, email string) *protocol.MemoryUser {
+-	if email == "" {
+-		return nil
+-	}
+-
+-	i.Lock()
+-	defer i.Unlock()
+-
+-	for _, u := range i.users {
+-		if strings.EqualFold(u.Email, email) {
+-			return u
+-		}
+-	}
+-	return nil
+-}
+-
+-// GetUsers implements proxy.UserManager.GetUsers().
+-func (i *MultiUserInbound) GetUsers(ctx context.Context) []*protocol.MemoryUser {
+-	i.Lock()
+-	defer i.Unlock()
+-	dst := make([]*protocol.MemoryUser, len(i.users))
+-	copy(dst, i.users)
+-	return dst
+-}
+-
+-// GetUsersCount implements proxy.UserManager.GetUsersCount().
+-func (i *MultiUserInbound) GetUsersCount(context.Context) int64 {
+-	i.Lock()
+-	defer i.Unlock()
+-	return int64(len(i.users))
+-}
+-
+-func (i *MultiUserInbound) Network() []net.Network {
+-	return i.networks
+-}
+-
+-func (i *MultiUserInbound) Process(ctx context.Context, network net.Network, connection stat.Connection, dispatcher routing.Dispatcher) error {
+-	inbound := session.InboundFromContext(ctx)
+-	inbound.Name = "shadowsocks-2022-multi"
+-	inbound.CanSpliceCopy = 3
+-
+-	var metadata M.Metadata
+-	if inbound.Source.IsValid() {
+-		metadata.Source = M.ParseSocksaddr(inbound.Source.NetAddr())
+-	}
+-
+-	ctx = session.ContextWithDispatcher(ctx, dispatcher)
+-
+-	if network == net.Network_TCP {
+-		return singbridge.ReturnError(i.service.NewConnection(ctx, connection, metadata))
+-	} else {
+-		reader := buf.NewReader(connection)
+-		pc := &natPacketConn{connection}
+-		for {
+-			mb, err := reader.ReadMultiBuffer()
+-			if err != nil {
+-				buf.ReleaseMulti(mb)
+-				return singbridge.ReturnError(err)
+-			}
+-			for _, buffer := range mb {
+-				packet := B.As(buffer.Bytes()).ToOwned()
+-				buffer.Release()
+-				err = i.service.NewPacket(ctx, pc, packet, metadata)
+-				if err != nil {
+-					packet.Release()
+-					buf.ReleaseMulti(mb)
+-					return err
+-				}
+-			}
+-		}
+-	}
+-}
+-
+-func (i *MultiUserInbound) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
+-	inbound := session.InboundFromContext(ctx)
+-	userInt, _ := A.UserFromContext[int](ctx)
+-	user := i.users[userInt]
+-	inbound.User = user
+-	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
+-		From:   metadata.Source,
+-		To:     metadata.Destination,
+-		Status: log.AccessAccepted,
+-		Email:  user.Email,
+-	})
+-	errors.LogInfo(ctx, "tunnelling request to tcp:", metadata.Destination)
+-	dispatcher := session.DispatcherFromContext(ctx)
+-	destination, err := singbridge.ToDestination(metadata.Destination, net.Network_TCP)
+-	if err != nil {
+-		return err
+-	}
+-	link, err := dispatcher.Dispatch(ctx, destination)
+-	if err != nil {
+-		return err
+-	}
+-	return singbridge.CopyConn(ctx, conn, link, conn)
+-}
+-
+-func (i *MultiUserInbound) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata M.Metadata) error {
+-	inbound := session.InboundFromContext(ctx)
+-	userInt, _ := A.UserFromContext[int](ctx)
+-	user := i.users[userInt]
+-	inbound.User = user
+-	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
+-		From:   metadata.Source,
+-		To:     metadata.Destination,
+-		Status: log.AccessAccepted,
+-		Email:  user.Email,
+-	})
+-	errors.LogInfo(ctx, "tunnelling request to udp:", metadata.Destination)
+-	dispatcher := session.DispatcherFromContext(ctx)
+-	destination, err := singbridge.ToDestination(metadata.Destination, net.Network_UDP)
+-	if err != nil {
+-		return err
+-	}
+-	link, err := dispatcher.Dispatch(ctx, destination)
+-	if err != nil {
+-		return err
+-	}
+-	outConn := &singbridge.PacketConnWrapper{
+-		Reader: link.Reader,
+-		Writer: link.Writer,
+-		Dest:   destination,
+-		T: signal.CancelAfterInactivity(ctx, func() {
+-			common.Interrupt(link.Reader)
+-		}, 300*time.Second),
+-	}
+-	return bufio.CopyPacketConn(ctx, conn, outConn)
+-}
+-
+-func (i *MultiUserInbound) NewError(ctx context.Context, err error) {
+-	if E.IsClosed(err) {
+-		return
+-	}
+-	errors.LogWarning(ctx, err.Error())
+-}
+diff --git a/proxy/shadowsocks_2022/inbound_relay.go b/proxy/shadowsocks_2022/inbound_relay.go
+deleted file mode 100644
+index 4ca5e20753c7..000000000000
+--- a/proxy/shadowsocks_2022/inbound_relay.go
++++ /dev/null
+@@ -1,194 +0,0 @@
+-package shadowsocks_2022
+-
+-import (
+-	"context"
+-	"strconv"
+-	"strings"
+-	"time"
+-
+-	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
+-	C "github.com/sagernet/sing/common"
+-	A "github.com/sagernet/sing/common/auth"
+-	B "github.com/sagernet/sing/common/buf"
+-	"github.com/sagernet/sing/common/bufio"
+-	E "github.com/sagernet/sing/common/exceptions"
+-	M "github.com/sagernet/sing/common/metadata"
+-	N "github.com/sagernet/sing/common/network"
+-	"github.com/xtls/xray-core/common"
+-	"github.com/xtls/xray-core/common/buf"
+-	"github.com/xtls/xray-core/common/errors"
+-	"github.com/xtls/xray-core/common/log"
+-	"github.com/xtls/xray-core/common/net"
+-	"github.com/xtls/xray-core/common/protocol"
+-	"github.com/xtls/xray-core/common/session"
+-	"github.com/xtls/xray-core/common/signal"
+-	"github.com/xtls/xray-core/common/singbridge"
+-	"github.com/xtls/xray-core/common/uuid"
+-	"github.com/xtls/xray-core/features/routing"
+-	"github.com/xtls/xray-core/transport/internet/stat"
+-)
+-
+-func init() {
+-	common.Must(common.RegisterConfig((*RelayServerConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+-		return NewRelayServer(ctx, config.(*RelayServerConfig))
+-	}))
+-}
+-
+-type RelayInbound struct {
+-	networks     []net.Network
+-	destinations []*RelayDestination
+-	service      *shadowaead_2022.RelayService[int]
+-}
+-
+-func NewRelayServer(ctx context.Context, config *RelayServerConfig) (*RelayInbound, error) {
+-	networks := config.Network
+-	if len(networks) == 0 {
+-		networks = []net.Network{
+-			net.Network_TCP,
+-			net.Network_UDP,
+-		}
+-	}
+-	inbound := &RelayInbound{
+-		networks:     networks,
+-		destinations: config.Destinations,
+-	}
+-	if !C.Contains(shadowaead_2022.List, config.Method) || !strings.Contains(config.Method, "aes") {
+-		return nil, errors.New("unsupported method ", config.Method)
+-	}
+-	service, err := shadowaead_2022.NewRelayServiceWithPassword[int](config.Method, config.Key, 500, inbound)
+-	if err != nil {
+-		return nil, errors.New("create service").Base(err)
+-	}
+-
+-	for i, destination := range config.Destinations {
+-		if destination.Email == "" {
+-			u := uuid.New()
+-			destination.Email = "unnamed-destination-" + strconv.Itoa(i) + "-" + u.String()
+-		}
+-	}
+-	err = service.UpdateUsersWithPasswords(
+-		C.MapIndexed(config.Destinations, func(index int, it *RelayDestination) int { return index }),
+-		C.Map(config.Destinations, func(it *RelayDestination) string { return it.Key }),
+-		C.Map(config.Destinations, func(it *RelayDestination) M.Socksaddr {
+-			return singbridge.ToSocksaddr(net.Destination{
+-				Address: it.Address.AsAddress(),
+-				Port:    net.Port(it.Port),
+-			})
+-		}),
+-	)
+-	if err != nil {
+-		return nil, errors.New("create service").Base(err)
+-	}
+-	inbound.service = service
+-	return inbound, nil
+-}
+-
+-func (i *RelayInbound) Network() []net.Network {
+-	return i.networks
+-}
+-
+-func (i *RelayInbound) Process(ctx context.Context, network net.Network, connection stat.Connection, dispatcher routing.Dispatcher) error {
+-	inbound := session.InboundFromContext(ctx)
+-	inbound.Name = "shadowsocks-2022-relay"
+-	inbound.CanSpliceCopy = 3
+-
+-	var metadata M.Metadata
+-	if inbound.Source.IsValid() {
+-		metadata.Source = M.ParseSocksaddr(inbound.Source.NetAddr())
+-	}
+-
+-	ctx = session.ContextWithDispatcher(ctx, dispatcher)
+-
+-	if network == net.Network_TCP {
+-		return singbridge.ReturnError(i.service.NewConnection(ctx, connection, metadata))
+-	} else {
+-		reader := buf.NewReader(connection)
+-		pc := &natPacketConn{connection}
+-		for {
+-			mb, err := reader.ReadMultiBuffer()
+-			if err != nil {
+-				buf.ReleaseMulti(mb)
+-				return singbridge.ReturnError(err)
+-			}
+-			for _, buffer := range mb {
+-				packet := B.As(buffer.Bytes()).ToOwned()
+-				buffer.Release()
+-				err = i.service.NewPacket(ctx, pc, packet, metadata)
+-				if err != nil {
+-					packet.Release()
+-					buf.ReleaseMulti(mb)
+-					return err
+-				}
+-			}
+-		}
+-	}
+-}
+-
+-func (i *RelayInbound) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
+-	inbound := session.InboundFromContext(ctx)
+-	userInt, _ := A.UserFromContext[int](ctx)
+-	user := i.destinations[userInt]
+-	inbound.User = &protocol.MemoryUser{
+-		Email: user.Email,
+-		Level: uint32(user.Level),
+-	}
+-	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
+-		From:   metadata.Source,
+-		To:     metadata.Destination,
+-		Status: log.AccessAccepted,
+-		Email:  user.Email,
+-	})
+-	errors.LogInfo(ctx, "tunnelling request to tcp:", metadata.Destination)
+-	dispatcher := session.DispatcherFromContext(ctx)
+-	destination, err := singbridge.ToDestination(metadata.Destination, net.Network_TCP)
+-	if err != nil {
+-		return err
+-	}
+-	link, err := dispatcher.Dispatch(ctx, destination)
+-	if err != nil {
+-		return err
+-	}
+-	return singbridge.CopyConn(ctx, nil, link, conn)
+-}
+-
+-func (i *RelayInbound) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata M.Metadata) error {
+-	inbound := session.InboundFromContext(ctx)
+-	userInt, _ := A.UserFromContext[int](ctx)
+-	user := i.destinations[userInt]
+-	inbound.User = &protocol.MemoryUser{
+-		Email: user.Email,
+-		Level: uint32(user.Level),
+-	}
+-	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
+-		From:   metadata.Source,
+-		To:     metadata.Destination,
+-		Status: log.AccessAccepted,
+-		Email:  user.Email,
+-	})
+-	errors.LogInfo(ctx, "tunnelling request to udp:", metadata.Destination)
+-	dispatcher := session.DispatcherFromContext(ctx)
+-	destination, err := singbridge.ToDestination(metadata.Destination, net.Network_UDP)
+-	if err != nil {
+-		return err
+-	}
+-	link, err := dispatcher.Dispatch(ctx, destination)
+-	if err != nil {
+-		return err
+-	}
+-	outConn := &singbridge.PacketConnWrapper{
+-		Reader: link.Reader,
+-		Writer: link.Writer,
+-		Dest:   destination,
+-		T: signal.CancelAfterInactivity(ctx, func() {
+-			common.Interrupt(link.Reader)
+-		}, 300*time.Second),
+-	}
+-	return bufio.CopyPacketConn(ctx, conn, outConn)
+-}
+-
+-func (i *RelayInbound) NewError(ctx context.Context, err error) {
+-	if E.IsClosed(err) {
+-		return
+-	}
+-	errors.LogWarning(ctx, err.Error())
+-}
+diff --git a/proxy/shadowsocks_2022/outbound.go b/proxy/shadowsocks_2022/outbound.go
+deleted file mode 100644
+index 5d1b9c9fb842..000000000000
+--- a/proxy/shadowsocks_2022/outbound.go
++++ /dev/null
+@@ -1,147 +0,0 @@
+-package shadowsocks_2022
+-
+-import (
+-	"context"
+-	"time"
+-
+-	shadowsocks "github.com/sagernet/sing-shadowsocks"
+-	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
+-	C "github.com/sagernet/sing/common"
+-	B "github.com/sagernet/sing/common/buf"
+-	"github.com/sagernet/sing/common/bufio"
+-	N "github.com/sagernet/sing/common/network"
+-	"github.com/xtls/xray-core/common"
+-	"github.com/xtls/xray-core/common/buf"
+-	"github.com/xtls/xray-core/common/errors"
+-	"github.com/xtls/xray-core/common/net"
+-	"github.com/xtls/xray-core/common/session"
+-	"github.com/xtls/xray-core/common/signal"
+-	"github.com/xtls/xray-core/common/singbridge"
+-	"github.com/xtls/xray-core/transport"
+-	"github.com/xtls/xray-core/transport/internet"
+-)
+-
+-func init() {
+-	common.Must(common.RegisterConfig((*ClientConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+-		return NewClient(ctx, config.(*ClientConfig))
+-	}))
+-}
+-
+-type Outbound struct {
+-	ctx    context.Context
+-	server net.Destination
+-	method shadowsocks.Method
+-}
+-
+-func NewClient(ctx context.Context, config *ClientConfig) (*Outbound, error) {
+-	o := &Outbound{
+-		ctx: ctx,
+-		server: net.Destination{
+-			Address: config.Address.AsAddress(),
+-			Port:    net.Port(config.Port),
+-			Network: net.Network_TCP,
+-		},
+-	}
+-	if C.Contains(shadowaead_2022.List, config.Method) {
+-		if config.Key == "" {
+-			return nil, errors.New("missing psk")
+-		}
+-		method, err := shadowaead_2022.NewWithPassword(config.Method, config.Key, nil)
+-		if err != nil {
+-			return nil, errors.New("create method").Base(err)
+-		}
+-		o.method = method
+-	} else {
+-		return nil, errors.New("unknown method ", config.Method)
+-	}
+-	return o, nil
+-}
+-
+-func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
+-	var inboundConn net.Conn
+-	inbound := session.InboundFromContext(ctx)
+-	if inbound != nil {
+-		inboundConn = inbound.Conn
+-	}
+-
+-	outbounds := session.OutboundsFromContext(ctx)
+-	ob := outbounds[len(outbounds)-1]
+-	if !ob.Target.IsValid() {
+-		return errors.New("target not specified")
+-	}
+-	ob.Name = "shadowsocks-2022"
+-	ob.CanSpliceCopy = 3
+-	destination := ob.Target
+-	network := destination.Network
+-
+-	errors.LogInfo(ctx, "tunneling request to ", destination, " via ", o.server.NetAddr())
+-
+-	serverDestination := o.server
+-	serverDestination.Network = network
+-	connection, err := dialer.Dial(ctx, serverDestination)
+-	if err != nil {
+-		return errors.New("failed to connect to server").Base(err)
+-	}
+-	defer connection.Close()
+-
+-	if session.TimeoutOnlyFromContext(ctx) {
+-		ctx, _ = context.WithCancel(context.Background())
+-	}
+-
+-	if network == net.Network_TCP {
+-		serverConn := o.method.DialEarlyConn(connection, singbridge.ToSocksaddr(destination))
+-		var handshake bool
+-		if timeoutReader, isTimeoutReader := link.Reader.(buf.TimeoutReader); isTimeoutReader {
+-			mb, err := timeoutReader.ReadMultiBufferTimeout(time.Millisecond * 100)
+-			if err != nil && err != buf.ErrNotTimeoutReader && err != buf.ErrReadTimeout {
+-				return errors.New("read payload").Base(err)
+-			}
+-			payload := B.New()
+-			for {
+-				payload.Reset()
+-				nb, n := buf.SplitBytes(mb, payload.FreeBytes())
+-				if n > 0 {
+-					payload.Truncate(n)
+-					_, err = serverConn.Write(payload.Bytes())
+-					if err != nil {
+-						payload.Release()
+-						return errors.New("write payload").Base(err)
+-					}
+-					handshake = true
+-				}
+-				if nb.IsEmpty() {
+-					break
+-				}
+-				mb = nb
+-			}
+-			payload.Release()
+-		}
+-		if !handshake {
+-			_, err = serverConn.Write(nil)
+-			if err != nil {
+-				return errors.New("client handshake").Base(err)
+-			}
+-		}
+-		return singbridge.CopyConn(ctx, inboundConn, link, serverConn)
+-	} else {
+-		var packetConn N.PacketConn
+-		if pc, isPacketConn := inboundConn.(N.PacketConn); isPacketConn {
+-			packetConn = pc
+-		} else if nc, isNetPacket := inboundConn.(net.PacketConn); isNetPacket {
+-			packetConn = bufio.NewPacketConn(nc)
+-		} else {
+-			packetConn = &singbridge.PacketConnWrapper{
+-				Reader: link.Reader,
+-				Writer: link.Writer,
+-				Conn:   inboundConn,
+-				Dest:   destination,
+-				T: signal.CancelAfterInactivity(ctx, func() {
+-					common.Interrupt(link.Reader)
+-				}, 300*time.Second),
+-			}
+-		}
+-
+-		serverConn := o.method.DialPacketConn(connection)
+-		return singbridge.ReturnError(bufio.CopyPacketConn(ctx, packetConn, serverConn))
+-	}
+-}
+diff --git a/proxy/shadowsocks_2022/shadowsocks_2022.go b/proxy/shadowsocks_2022/shadowsocks_2022.go
+deleted file mode 100644
+index 96f62c74b692..000000000000
+--- a/proxy/shadowsocks_2022/shadowsocks_2022.go
++++ /dev/null
+@@ -1 +0,0 @@
+-package shadowsocks_2022
+diff --git a/testing/scenarios/shadowsocks_2022_test.go b/testing/scenarios/shadowsocks_2022_test.go
+deleted file mode 100644
+index c5e0f8b3d976..000000000000
+--- a/testing/scenarios/shadowsocks_2022_test.go
++++ /dev/null
+@@ -1,221 +0,0 @@
+-package scenarios
+-
+-import (
+-	"crypto/rand"
+-	"encoding/base64"
+-	"testing"
+-	"time"
+-
+-	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
+-	"github.com/xtls/xray-core/app/log"
+-	"github.com/xtls/xray-core/app/proxyman"
+-	"github.com/xtls/xray-core/common"
+-	clog "github.com/xtls/xray-core/common/log"
+-	"github.com/xtls/xray-core/common/net"
+-	"github.com/xtls/xray-core/common/serial"
+-	"github.com/xtls/xray-core/core"
+-	"github.com/xtls/xray-core/proxy/dokodemo"
+-	"github.com/xtls/xray-core/proxy/freedom"
+-	"github.com/xtls/xray-core/proxy/shadowsocks_2022"
+-	"github.com/xtls/xray-core/testing/servers/tcp"
+-	"github.com/xtls/xray-core/testing/servers/udp"
+-	"golang.org/x/sync/errgroup"
+-)
+-
+-func TestShadowsocks2022Tcp(t *testing.T) {
+-	for _, method := range shadowaead_2022.List {
+-		password := make([]byte, 32)
+-		rand.Read(password)
+-		t.Run(method, func(t *testing.T) {
+-			testShadowsocks2022Tcp(t, method, base64.StdEncoding.EncodeToString(password))
+-		})
+-	}
+-}
+-
+-func TestShadowsocks2022UdpAES128(t *testing.T) {
+-	password := make([]byte, 32)
+-	rand.Read(password)
+-	testShadowsocks2022Udp(t, shadowaead_2022.List[0], base64.StdEncoding.EncodeToString(password))
+-}
+-
+-func TestShadowsocks2022UdpAES256(t *testing.T) {
+-	password := make([]byte, 32)
+-	rand.Read(password)
+-	testShadowsocks2022Udp(t, shadowaead_2022.List[1], base64.StdEncoding.EncodeToString(password))
+-}
+-
+-func TestShadowsocks2022UdpChacha(t *testing.T) {
+-	password := make([]byte, 32)
+-	rand.Read(password)
+-	testShadowsocks2022Udp(t, shadowaead_2022.List[2], base64.StdEncoding.EncodeToString(password))
+-}
+-
+-func testShadowsocks2022Tcp(t *testing.T, method string, password string) {
+-	tcpServer := tcp.Server{
+-		MsgProcessor: xor,
+-	}
+-	dest, err := tcpServer.Start()
+-	common.Must(err)
+-	defer tcpServer.Close()
+-
+-	serverPort := tcp.PickPort()
+-	serverConfig := &core.Config{
+-		App: []*serial.TypedMessage{
+-			serial.ToTypedMessage(&log.Config{
+-				ErrorLogLevel: clog.Severity_Debug,
+-				ErrorLogType:  log.LogType_Console,
+-			}),
+-		},
+-		Inbound: []*core.InboundHandlerConfig{
+-			{
+-				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+-					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(serverPort)}},
+-					Listen:   net.NewIPOrDomain(net.LocalHostIP),
+-				}),
+-				ProxySettings: serial.ToTypedMessage(&shadowsocks_2022.ServerConfig{
+-					Method:  method,
+-					Key:     password,
+-					Network: []net.Network{net.Network_TCP},
+-				}),
+-			},
+-		},
+-		Outbound: []*core.OutboundHandlerConfig{
+-			{
+-				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+-					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+-				}),
+-			},
+-		},
+-	}
+-
+-	clientPort := tcp.PickPort()
+-	clientConfig := &core.Config{
+-		App: []*serial.TypedMessage{
+-			serial.ToTypedMessage(&log.Config{
+-				ErrorLogLevel: clog.Severity_Debug,
+-				ErrorLogType:  log.LogType_Console,
+-			}),
+-		},
+-		Inbound: []*core.InboundHandlerConfig{
+-			{
+-				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+-					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(clientPort)}},
+-					Listen:   net.NewIPOrDomain(net.LocalHostIP),
+-				}),
+-				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
+-					RewriteAddress:  net.NewIPOrDomain(dest.Address),
+-					RewritePort:     uint32(dest.Port),
+-					AllowedNetworks: []net.Network{net.Network_TCP},
+-				}),
+-			},
+-		},
+-		Outbound: []*core.OutboundHandlerConfig{
+-			{
+-				ProxySettings: serial.ToTypedMessage(&shadowsocks_2022.ClientConfig{
+-					Address: net.NewIPOrDomain(net.LocalHostIP),
+-					Port:    uint32(serverPort),
+-					Method:  method,
+-					Key:     password,
+-				}),
+-			},
+-		},
+-	}
+-
+-	servers, err := InitializeServerConfigs(serverConfig, clientConfig)
+-	common.Must(err)
+-	defer CloseAllServers(servers)
+-
+-	var errGroup errgroup.Group
+-	for range 3 {
+-		errGroup.Go(testTCPConn(clientPort, 10240*1024, time.Second*20))
+-	}
+-
+-	if err := errGroup.Wait(); err != nil {
+-		t.Error(err)
+-	}
+-}
+-
+-func testShadowsocks2022Udp(t *testing.T, method string, password string) {
+-	udpServer := udp.Server{
+-		MsgProcessor: xor,
+-	}
+-	udpDest, err := udpServer.Start()
+-	common.Must(err)
+-	defer udpServer.Close()
+-
+-	serverPort := udp.PickPort()
+-	serverConfig := &core.Config{
+-		App: []*serial.TypedMessage{
+-			serial.ToTypedMessage(&log.Config{
+-				ErrorLogLevel: clog.Severity_Debug,
+-				ErrorLogType:  log.LogType_Console,
+-			}),
+-		},
+-		Inbound: []*core.InboundHandlerConfig{
+-			{
+-				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+-					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(serverPort)}},
+-					Listen:   net.NewIPOrDomain(net.LocalHostIP),
+-				}),
+-				ProxySettings: serial.ToTypedMessage(&shadowsocks_2022.ServerConfig{
+-					Method:  method,
+-					Key:     password,
+-					Network: []net.Network{net.Network_UDP},
+-				}),
+-			},
+-		},
+-		Outbound: []*core.OutboundHandlerConfig{
+-			{
+-				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+-					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+-				}),
+-			},
+-		},
+-	}
+-
+-	udpClientPort := udp.PickPort()
+-	clientConfig := &core.Config{
+-		App: []*serial.TypedMessage{
+-			serial.ToTypedMessage(&log.Config{
+-				ErrorLogLevel: clog.Severity_Debug,
+-				ErrorLogType:  log.LogType_Console,
+-			}),
+-		},
+-		Inbound: []*core.InboundHandlerConfig{
+-			{
+-				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+-					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(udpClientPort)}},
+-					Listen:   net.NewIPOrDomain(net.LocalHostIP),
+-				}),
+-				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
+-					RewriteAddress:  net.NewIPOrDomain(udpDest.Address),
+-					RewritePort:     uint32(udpDest.Port),
+-					AllowedNetworks: []net.Network{net.Network_UDP},
+-				}),
+-			},
+-		},
+-		Outbound: []*core.OutboundHandlerConfig{
+-			{
+-				ProxySettings: serial.ToTypedMessage(&shadowsocks_2022.ClientConfig{
+-					Address: net.NewIPOrDomain(net.LocalHostIP),
+-					Port:    uint32(serverPort),
+-					Method:  method,
+-					Key:     password,
+-				}),
+-			},
+-		},
+-	}
+-
+-	servers, err := InitializeServerConfigs(serverConfig, clientConfig)
+-	common.Must(err)
+-	defer CloseAllServers(servers)
+-
+-	var errGroup errgroup.Group
+-	for range 3 {
+-		errGroup.Go(testUDPConn(udpClientPort, 1024, time.Second*5))
+-	}
+-
+-	if err := errGroup.Wait(); err != nil {
+-		t.Error(err)
+-	}
+-}
