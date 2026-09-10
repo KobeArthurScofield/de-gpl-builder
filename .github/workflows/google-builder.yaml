@@ -39,14 +39,14 @@ jobs:
           echo "GOOS: $GOOS, GOARCH: $GOARCH, RELEASE_NAME: $_NAME"
           echo "ASSET_NAME=$_NAME" >> $GITHUB_ENV
       - name: Checkout codebase
-        uses: actions/checkout@latest
+        uses: actions/checkout@v7
         with:
           repository: 'XTLS/Xray-core'
           ref: '26.9.9'
           path: 'xray'
 
       - name: Checkout patch
-        uses: actions/checkout@latest
+        uses: actions/checkout@v7
         with:
           path: 'patch'
 
@@ -57,7 +57,7 @@ jobs:
           cd ${GITHUB_WORKSPACE}
 
       - name: Set up Go
-        uses: actions/setup-go@latest
+        uses: actions/setup-go@v7
         with:
           go-version-file: 'xray/go.mod'
           check-latest: true
@@ -102,14 +102,14 @@ jobs:
           done
 
       - name: Upload files to Artifacts
-        uses: actions/upload-artifact@latest
+        uses: actions/upload-artifact@v7
         with:
           name: Xray-google-go-${{ env.ASSET_NAME }}
           path: |
             ./build_assets/*
 
       - name: Upload binaries to release
-        uses: svenstaro/upload-release-action@latest
+        uses: svenstaro/upload-release-action@v2
         if: github.event_name == 'release'
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
