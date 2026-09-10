@@ -6,7 +6,7 @@ on:
     types: [published]
   push:
     paths:
-      - ".github/workflows/google-builder.yml"
+      - ".github/workflows/google-builder.yaml"
 jobs:
   build:
     permissions:

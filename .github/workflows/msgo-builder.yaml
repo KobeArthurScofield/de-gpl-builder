@@ -6,7 +6,7 @@ on:
     types: [published]
   push:
     paths:
-      - ".github/workflows/msgo-builder.yml"
+      - ".github/workflows/msgo-builder.yaml"
 jobs:
   build:
     permissions:

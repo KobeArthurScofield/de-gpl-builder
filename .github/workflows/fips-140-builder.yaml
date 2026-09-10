@@ -6,7 +6,7 @@ on:
     types: [published]
   push:
     paths:
-      - ".github/workflows/fips-140-builder.yml"
+      - ".github/workflows/fips-140-builder.yaml"
 jobs:
   build:
     permissions:
