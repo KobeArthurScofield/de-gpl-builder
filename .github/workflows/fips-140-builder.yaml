@@ -43,7 +43,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: 'XTLS/Xray-core'
-          ref: '26.9.9'
+          ref: 'v26.9.9'
           path: 'xray'
 
       - name: Checkout patch
